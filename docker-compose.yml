@@ -1,0 +1,194 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.11.2
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW_CONN_SPARK_DEFAULT: 'spark://spark-master:7077'
+    AIRFLOW_CONN_KAFKA_DEFAULT: 'kafka://?bootstrap.servers=redpanda:9092&group.id=airflow-streaming-health-check'
+    AIRFLOW_CONN_INGESTION_POLLER: 'http://ingestion:8091'
+    # Local-stack convenience only; build a real image with these baked in for prod.
+    _PIP_ADDITIONAL_REQUIREMENTS: 'pyspark==4.0.0 delta-spark==4.0.0 apache-airflow-providers-http apache-airflow-providers-apache-kafka apache-airflow-providers-apache-spark apache-airflow-providers-slack'
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./spark_jobs:/opt/airflow/spark_jobs:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v26.1.12
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=redpanda:8082
+    ports:
+      - "19092:19092" # Kafka API (host clients)
+      - "18082:8082"  # Pandaproxy (REST)
+      - "19644:9644"  # Admin API / health
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - transit-net
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - transit-net
+
+  postgres:
+    image: postgres:16.14-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - transit-net
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname admin --lastname admin \
+          --role Admin --email admin@example.com
+    networks:
+      - transit-net
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8085:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - transit-net
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - transit-net
+
+  spark-master:
+    image: bitnamilegacy/spark:4.0.0
+    container_name: spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+    ports:
+      - "7077:7077" # Master RPC
+      - "8080:8080" # Master UI
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+    networks:
+      - transit-net
+
+  spark-worker:
+    image: bitnamilegacy/spark:4.0.0
+    container_name: spark-worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_WORKER_CORES: 1
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+    ports:
+      - "8081:8081" # Worker UI
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+    depends_on:
+      - spark-master
+    networks:
+      - transit-net
+
+  api:
+    build: ./api
+    container_name: api
+    environment:
+      PORT: "8090"
+    ports:
+      - "8090:8090"
+    networks:
+      - transit-net
+
+  ingestion:
+    build: ./ingestion
+    container_name: ingestion
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: gps_raw
+      HEALTH_PORT: "8091"
+    ports:
+      - "8091:8091" # /healthz, polled by streaming_health_check
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - transit-net
+
+networks:
+  transit-net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  postgres_data:
