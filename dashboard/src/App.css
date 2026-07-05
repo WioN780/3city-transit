@@ -1,0 +1,112 @@
+.app-header {
+  padding: 1rem 1.5rem;
+  background: #0d1b2a;
+  color: white;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.app-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.app-grid > .panel:last-child {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .app-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .app-grid > .panel:last-child {
+    grid-column: auto;
+  }
+}
+
+.panel {
+  background: white;
+  border-radius: 8px;
+  padding: 1rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.window-selector {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.window-selector button {
+  border: 1px solid #ccc;
+  background: white;
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.window-selector button.active {
+  background: #1565c0;
+  color: white;
+  border-color: #1565c0;
+}
+
+.status {
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.status.error {
+  color: #c62828;
+}
+
+.leaderboard {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.leaderboard th,
+.leaderboard td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid #eee;
+  font-size: 0.9rem;
+}
+
+.leaderboard tbody tr {
+  cursor: pointer;
+}
+
+.leaderboard tbody tr:hover {
+  background: #f0f4ff;
+}
+
+.leaderboard tbody tr.selected {
+  background: #dbe7ff;
+}
+
+.map-wrap {
+  height: 360px;
+  border-radius: 6px;
+  overflow: hidden;
+}

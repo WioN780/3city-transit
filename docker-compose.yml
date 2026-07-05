@@ -170,6 +170,19 @@ services:
     networks:
       - transit-net
 
+  dashboard:
+    build:
+      context: ./dashboard
+      args:
+        VITE_API_BASE_URL: http://localhost:8090
+    container_name: dashboard
+    ports:
+      - "5173:80" # matches the api's default DASHBOARD_ORIGIN for CORS
+    depends_on:
+      - api
+    networks:
+      - transit-net
+
   ingestion:
     build: ./ingestion
     container_name: ingestion

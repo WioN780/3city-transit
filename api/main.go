@@ -19,6 +19,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/routes/worst-offenders", cached(cache, worstOffendersHandler(db, cfg)))
+	mux.Handle("/api/v1/routes/{route_id}/timeseries", cached(cache, routeTimeseriesHandler(db, cfg)))
 	mux.Handle("/api/v1/hotspots", cached(cache, hotspotsHandler(db, cfg)))
 	mux.HandleFunc("/api/v1/healthz", healthzHandler(db, cfg))
 

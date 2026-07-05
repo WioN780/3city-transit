@@ -79,6 +79,7 @@ func testServer(t *testing.T) *httptest.Server {
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/v1/routes/worst-offenders", cached(cache, worstOffendersHandler(db, cfg)))
+	mux.Handle("/api/v1/routes/{route_id}/timeseries", cached(cache, routeTimeseriesHandler(db, cfg)))
 	mux.Handle("/api/v1/hotspots", cached(cache, hotspotsHandler(db, cfg)))
 	mux.HandleFunc("/api/v1/healthz", healthzHandler(db, cfg))
 
@@ -177,6 +178,81 @@ func TestHotspotsFilteredByRoute(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&body)
 	if len(body.Hotspots) != 1 || !approx(body.Hotspots[0].AvgDelaySec, 50.0) {
 		t.Fatalf("expected exactly route 2's bucket (avg=50), got %+v", body.Hotspots)
+	}
+}
+
+func TestRouteTimeseries(t *testing.T) {
+	srv := testServer(t)
+
+	// route 2 has a single fixture row (on_time_pct=95, avg_delay=10, see
+	// TestWorstOffenders), so its timeseries must reduce to exactly one
+	// point carrying those same values.
+	resp, err := http.Get(srv.URL + "/api/v1/routes/2/timeseries?" + fixtureWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var body struct {
+		RouteID string            `json:"route_id"`
+		Window  string            `json:"window"`
+		Points  []timeseriesPoint `json:"points"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.RouteID != "2" {
+		t.Fatalf("expected route_id echoed back, got %q", body.RouteID)
+	}
+	if len(body.Points) != 1 {
+		t.Fatalf("expected 1 point for route 2, got %d: %+v", len(body.Points), body.Points)
+	}
+	if !approx(body.Points[0].OnTimePct, 95.0) || !approx(body.Points[0].AvgDelaySec, 10.0) {
+		t.Fatalf("expected on_time_pct=95 avg_delay=10, got %+v", body.Points[0])
+	}
+
+	// route 1 has two fixture rows that weighted-average to on_time_pct=50,
+	// avg_delay=240 across however many service_dates they fall on -- so
+	// re-weighting the returned points by their sample_count must reproduce
+	// that same aggregate regardless of how many points come back.
+	resp2, err := http.Get(srv.URL + "/api/v1/routes/1/timeseries?" + fixtureWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var body2 struct {
+		Points []timeseriesPoint `json:"points"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&body2); err != nil {
+		t.Fatal(err)
+	}
+	if len(body2.Points) == 0 {
+		t.Fatal("expected at least one point for route 1")
+	}
+	var onTimeSum, delaySum, samples float64
+	for _, p := range body2.Points {
+		onTimeSum += p.OnTimePct * float64(p.SampleCount)
+		delaySum += p.AvgDelaySec * float64(p.SampleCount)
+		samples += float64(p.SampleCount)
+	}
+	if !approx(onTimeSum/samples, 50.0) || !approx(delaySum/samples, 240.0) {
+		t.Fatalf("expected re-weighted points to reproduce on_time_pct=50 avg_delay=240, got %+v", body2.Points)
+	}
+}
+
+func TestRouteTimeseriesMissingRouteID(t *testing.T) {
+	srv := testServer(t)
+
+	resp, err := http.Get(srv.URL + "/api/v1/routes//timeseries?" + fixtureWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 or 404 for missing route_id, got %d", resp.StatusCode)
 	}
 }
 

@@ -127,6 +127,34 @@ func hotspotsHandler(db *sql.DB, cfg config) func(r *http.Request) ([]byte, int,
 	}
 }
 
+func routeTimeseriesHandler(db *sql.DB, cfg config) func(r *http.Request) ([]byte, int, error) {
+	return func(r *http.Request) ([]byte, int, error) {
+		routeID := r.PathValue("route_id")
+		if routeID == "" {
+			return nil, http.StatusBadRequest, &apiError{"route_id is required"}
+		}
+		since, window, err := parseWindow(r.URL.Query().Get("window"))
+		if err != nil {
+			return nil, http.StatusBadRequest, err
+		}
+
+		points, err := fetchRouteTimeseries(db, cfg, routeID, since)
+		if err != nil {
+			slog.Error("route timeseries query failed", "error", err, "route_id", routeID)
+			return nil, http.StatusInternalServerError, &apiError{"failed to query route timeseries"}
+		}
+		if points == nil {
+			points = []timeseriesPoint{}
+		}
+
+		body, err := json.Marshal(map[string]any{"route_id": routeID, "window": window, "points": points})
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		return body, http.StatusOK, nil
+	}
+}
+
 // healthFreshWindow is how stale the newest bronze GPS ping can be before
 // /healthz reports "degraded" -- a few multiples of the poller's 30s cadence.
 const healthFreshWindow = 5 * time.Minute

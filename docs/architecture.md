@@ -113,6 +113,15 @@ GET /api/v1/routes/worst-offenders?window=7d
   ]
 }
 
+GET /api/v1/routes/{route_id}/timeseries?window=7d
+{
+  "route_id": "string",
+  "window": "7d",
+  "points": [
+    { "service_date": "date", "on_time_pct": "float", "avg_delay_seconds": "float", "sample_count": "int" }
+  ]
+}
+
 GET /api/v1/hotspots?route_id=&window=
 {
   "hotspots": [

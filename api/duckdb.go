@@ -196,6 +196,55 @@ func fetchHotspots(db *sql.DB, cfg config, sinceDate time.Time, routeID string) 
 	return result, nil
 }
 
+type timeseriesPoint struct {
+	ServiceDate string  `json:"service_date"`
+	OnTimePct   float64 `json:"on_time_pct"`
+	AvgDelaySec float64 `json:"avg_delay_seconds"`
+	SampleCount int64   `json:"sample_count"`
+}
+
+// fetchRouteTimeseries returns one point per service_date for routeID,
+// weighting the (possibly several, one-per-hour-of-day) rows on each date
+// the same way fetchWorstOffenders weights across dates.
+func fetchRouteTimeseries(db *sql.DB, cfg config, routeID string, sinceDate time.Time) ([]timeseriesPoint, error) {
+	rows, err := db.Query(fmt.Sprintf(`
+		SELECT CAST(service_date AS VARCHAR) AS service_date,
+		       SUM(on_time_pct * sample_count) AS on_time_weighted_sum,
+		       SUM(avg_delay_seconds * sample_count) AS delay_weighted_sum,
+		       SUM(sample_count) AS total_samples
+		FROM %s
+		WHERE service_date >= ? AND route_id = ?
+		GROUP BY service_date
+	`, cfg.routePerformanceSource), sinceDate.Format("2006-01-02"), routeID)
+	if err != nil {
+		return nil, fmt.Errorf("query route timeseries: %w", err)
+	}
+	defer rows.Close()
+
+	var result []timeseriesPoint
+	for rows.Next() {
+		var serviceDate string
+		var onTimeSum, delaySum, samples float64
+		if err := rows.Scan(&serviceDate, &onTimeSum, &delaySum, &samples); err != nil {
+			return nil, fmt.Errorf("scan route timeseries: %w", err)
+		}
+		if samples == 0 {
+			continue
+		}
+		result = append(result, timeseriesPoint{
+			ServiceDate: serviceDate,
+			OnTimePct:   onTimeSum / samples,
+			AvgDelaySec: delaySum / samples,
+			SampleCount: int64(samples),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ServiceDate < result[j].ServiceDate })
+	return result, nil
+}
+
 // fetchLastGPSIngest reports the freshest bronze ingest timestamp DuckDB
 // can see, or a zero time if the table is empty/unreachable.
 func fetchLastGPSIngest(db *sql.DB, cfg config) (time.Time, error) {
