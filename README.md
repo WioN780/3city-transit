@@ -28,22 +28,96 @@ Go poller (30s cron) -> Kafka topic gps_raw
 See [docs/architecture.md](docs/architecture.md) for the full schema
 reference (Kafka payload, bronze/silver/gold table layouts, API contract).
 
+## System Architecture & Data Flow
+
+```
++------------------+     +-------------------+
+|  GTFS-RT Feed    |     |   GTFS Static     |
+| (ZTM Gdańsk API) |     | (ZTM Gdańsk Zip)  |
++--------+---------+     +---------+---------+
+         | (30s HTTP poll)         | (Daily HTTP download)
+         v                         v
++--------+---------+     +---------+---------+
+|    Go Poller     |     |   Airflow DAG     |
+| (ingestion serv) |     |  gtfs_static_ref  |
++--------+---------+     +---------+---------+
+         | (Produce)               | (Submit Spark Job)
+         v                         v
++--------+---------+     +---------+---------+
+|     Redpanda     |     |  Spark Master/Wrk |
+|  (Kafka: raw)    |     | (gtfs_static.*)   |
++--------+---------+     +---------+---------+
+         |                         |
+         | (Spark Streaming)       | (Overwrite Delta)
+         +----------+     +--------+
+                    |     |
+                    v     v
++-------------------+-----+------------------+
+|                  MinIO Bucket              |
+|                   (Lakehouse)              |
+|                                            |
+|   +------------------------------------+   |
+|   | bronze.gps_positions (Delta)       |   v
+|   +-----------------+------------------+   |  +--------------------+
+|                     |                      |  |     Go Watchdog    |
+|                     | (Join & calculate)   |  | (Metadata Polling) |
+|                     v                      |  +--------------------+
+|   +------------------------------------+   |
+|   | silver.trip_delays (Delta)         |   v
+|   +-----------------+------------------+   |  +--------------------+
+|                     |                      |  | Data Quality checks|
+|                     | (Rollup aggregations)|  | (Airflow Spark job)|
+|                     v                      |  +--------------------+
+|   +------------------------------------+   |
+|   | gold.route_performance             |   |
+|   | gold.delay_hotspots (Delta)        |   |
+|   +-----------------+------------------+   |
++---------------------+----------------------+
+                      |
+                      | (delta_scan / DuckDB httpfs)
+                      v
+             +--------+---------+
+             |      Go API      |
+             |  (api service)   |
+             +--------+---------+
+                      |
+                      | (JSON HTTP REST)
+                      v
+             +--------+---------+
+             | React Dashboard  |
+             | (Vite/Nginx serv)|
+             +------------------+
+```
+
+The system implements a real-time Medallion Lakehouse architecture orchestrated by Airflow and validated by data quality sidecars:
+
+1. **Ingestion Layer**:
+   - **Go Ingestion Poller** (`ingestion/`): Polls Gdańsk's GTFS-RT endpoint every 30 seconds, maps protobuf payloads to JSON, and publishes them to the Kafka topic `gps_raw` hosted on **Redpanda**.
+2. **Lakehouse Storage Layer (MinIO)**:
+   - S3-compatible object store hosting all Delta tables under the `lakehouse` bucket.
+   - **Bronze**: Raw, streaming appends in `bronze.gps_positions`.
+   - **Silver**: Stop-level delay table `silver.trip_delays`, enriched by joining GPS coordinates with the schedule.
+   - **Gold**: High-performance hourly aggregations `gold.route_performance` (leaderboards) and `gold.delay_hotspots` (geographical map grids).
+3. **Processing Layer (Spark)**:
+   - **Bronze Streaming** (`ingest_bronze.py`): A Structured Streaming job that reads from Kafka, filters malformed JSON payloads, and streams raw pings into the bronze table.
+   - **GTFS Static Refresh** (`download_gtfs_static.py`): Spark batch job triggered daily to download, parse, and write GTFS static files (`routes`, `stops`, `stop_times`, `trips`, `calendar_dates`) to MinIO.
+   - **Trip Delays** (`build_trip_delays.py`): Joins bronze GPS pings against scheduled stop times using the Haversine formula for spatial alignment and timezone-aware calculations for Warsaw local time, outputting stop-by-stop delay metrics.
+   - **Gold rollups** (`build_route_performance.py` / `build_delay_hotspots.py`): Aggregates delay statistics hourly.
+4. **Data Quality & Observability (New)**:
+   - **Go Watchdog Sidecar** (`data_quality/`): Runs continuously as a lightweight sidecar. It queries MinIO metadata (Delta transaction logs) directly for `bronze.gps_positions` and issues warnings or webhook alerts if the table has not received updates for over 5 minutes.
+   - **Data Quality Checks DAG** (`spark_jobs/data_quality/check_trip_delays.py`): Runs as an Airflow task checking `silver.trip_delays` for schema drift, null rates on critical columns, and delay-value sanity bounds (e.g. flagging impossible negative or extreme delays).
+5. **Serving & Presentation Layer**:
+   - **Go API** (`api/`): Serving Go REST service using embedded **DuckDB**'s `delta_scan` over S3/MinIO to query gold tables at high speed with low overhead, fronted by an in-memory TTL cache.
+   - **React Dashboard** (`dashboard/`): Nginx-served frontend rendering live leaderboards, interactive maps of delay hotspots, and route on-time performance charts.
+
 ## Features
 
-- **Live ingestion** — a Go poller pulls ZTM Gdańsk's real-time vehicle
-  positions every 30 seconds and publishes them to Kafka.
-- **Streaming + batch lakehouse** — Spark Structured Streaming lands raw GPS
-  into a partitioned Delta table; scheduled batch jobs join it against the
-  GTFS static schedule to compute per-stop delay and per-vehicle speed, then
-  roll that up into hourly route-performance and delay-hotspot aggregates.
-- **Go API** — reads the gold tables directly out of MinIO with DuckDB's
-  `delta_scan()` (no Spark cluster needed to serve reads), with an in-memory
-  TTL cache in front of it.
-- **React dashboard** — a worst-performing-routes leaderboard, a delay-hotspot
-  map, and an on-time % time series for a selected route, all backed by live
-  API data.
-- **Orchestration** — Airflow schedules the GTFS refresh, hourly gold
-  aggregation, a streaming-health monitor, and a data-quality check skeleton.
+- **Live Ingestion** — a Go poller pulls ZTM Gdańsk's real-time vehicle positions and publishes them to Kafka.
+- **Medallion Lakehouse** — Spark Structured Streaming lands raw GPS into Delta; scheduled batch jobs compute delay metrics against the static schedule.
+- **Go API with DuckDB** — Serves aggregated results directly out of MinIO using DuckDB's in-memory engine, bypassing the need for a persistent Spark cluster for reads.
+- **React Dashboard** — Responsive worst-performing-routes leaderboard, Leaflet delay-hotspot map, and route timeseries.
+- **Automatic Data Quality Watchdog** — Independent Go sidecar alerting if raw data ingestion stops.
+- **Airflow Quality Gates** — Validates schema, null rates, and metrics on silver data before gold ingestion.
 
 ## Tech stack
 
@@ -53,137 +127,104 @@ reference (Kafka payload, bronze/silver/gold table layouts, API contract).
 | Streaming      | Kafka (Redpanda)                                      |
 | Processing     | PySpark Structured Streaming + batch, Delta Lake      |
 | Storage        | MinIO (S3-compatible object storage)                  |
-| Orchestration  | Apache Airflow (LocalExecutor)                        |
+| Orchestration  | Apache Airflow (LocalExecutor + Postgres)             |
 | API            | Go, DuckDB (`delta_scan`)                             |
 | Dashboard      | React, Vite, react-leaflet, recharts                  |
+| Quality/Obs.   | Go Watchdog Sidecar, PySpark Quality Asserts         |
 | Infra          | Docker Compose                                        |
 
 ## Repository layout
 
 ```
-ingestion/      Go GPS poller -- polls ZTM Gdańsk's GTFS-RT feed and
-                publishes to Kafka topic gps_raw
-api/            Go API served to the dashboard -- reads gold.route_performance
-                / gold.delay_hotspots (and bronze, for /healthz) straight out
-                of MinIO via DuckDB's delta_scan(), no Spark involved
-spark_jobs/     PySpark bronze/silver/gold jobs
-  bronze/       gps_raw (Kafka) -> bronze.gps_positions (Delta/MinIO),
-                partitioned by ingest_date/ingest_hour
-  silver/       GTFS static downloader (gtfs_static.*, partitioned by
-                feed_date) and bronze.gps_positions -> silver.trip_delays
-  gold/         silver.trip_delays -> gold.route_performance /
-                gold.delay_hotspots
-airflow/dags/   GTFS refresh, hourly gold aggregation, streaming health
-                check, and a data-quality check skeleton
-dashboard/      React (Vite) dashboard -- leaderboard, hotspot map, and
-                per-route time series against the api/ contract
-data_quality/   Reserved for standalone data-quality check scripts
+ingestion/      Go GPS poller -- polls live GTFS-RT feed and publishes to Kafka
+api/            Go API served to the dashboard -- reads gold tables via DuckDB delta_scan
+spark_jobs/     PySpark jobs (bronze streaming, silver delays, gold rollup, data quality)
+  bronze/       gps_raw (Kafka) -> bronze.gps_positions (Delta/MinIO)
+  silver/       GTFS downloader and bronze.gps_positions -> silver.trip_delays
+  gold/         silver.trip_delays -> gold tables
+  data_quality/ check_trip_delays.py assertions (schema, nulls, sanity bounds)
+airflow/dags/   GTFS refresh, hourly gold aggregation, streaming health check, and data-quality checks
+dashboard/      React (Vite) dashboard served via Nginx in Docker Compose
+data_quality/   Go watchdog sidecar daemon -- monitors bronze MinIO table metadata freshness
 docs/           Architecture and schema reference
-tests/          Reserved for test suites
+tests/          PySpark delay-calculation unit test suite (timezone DST, early arrivals, trip filtering)
 ```
 
-## Getting started
+## Getting started & 5-minute demo
 
-Prerequisites: Docker + Docker Compose, Go 1.24+, Node 20+ (only needed for
-local dev outside Docker).
+Prerequisites: Docker + Docker Desktop, Go 1.23+ and Node 20+ (only if running locally outside Docker).
 
-```
+### 1. Bring up the Stack
+Build and launch all services from a clean state (Redpanda, MinIO, Postgres, Airflow, Spark master/worker, Go API, React dashboard, Go Watchdog):
+
+```bash
 docker compose up -d --build
 ```
 
-This builds and starts Redpanda, MinIO, Postgres (Airflow's metadata DB),
-Airflow (webserver + scheduler), a Spark master + worker, the Go API, and the
-dashboard.
+### 2. Run One-Time Configuration
+Redo these setup commands whenever the Compose containers are completely recreated (they do not persist across `docker compose down -v`):
 
-One-time setup after the first `up` (these don't persist across
-`docker compose down`, so redo them whenever containers are recreated):
-
-```
+```bash
+# Create the raw Kafka topic
 docker exec redpanda rpk topic create gps_raw
+
+# Setup the MinIO CLI alias and create the lakehouse bucket
 docker exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
 docker exec minio mc mb local/lakehouse
+
+# Patch passwd files to resolve Spark's local username lookups in container
 docker exec --user root spark-master sh -c "echo 'spark:x:1001:0:spark:/tmp:/bin/sh' >> /etc/passwd"
 docker exec --user root spark-worker sh -c "echo 'spark:x:1001:0:spark:/tmp:/bin/sh' >> /etc/passwd"
 ```
 
-(The `/etc/passwd` entry works around `bitnamilegacy/spark:4.0.0` running as a
-UID with no matching passwd entry, which otherwise crashes `spark-submit
---packages` with `LoginException: invalid null input: name` the moment Hadoop
-needs to resolve a username. `1001` is that image's fixed UID — confirm with
-`docker exec spark-master id -u` if it ever changes. The command is written
-without `$(id -u)` so it runs unmodified in both bash and PowerShell, since
-PowerShell's native-argument parsing splits on double quotes rather than
-single quotes and mangles the substitution form.)
+### 3. Run the E2E Pipeline (5-Minute Demo)
 
-## Running the full pipeline (5-minute demo)
+Once the stack is configured, execute these steps in order to stream, clean, check, and serve transit data:
 
-The dashboard reads from the gold tables, which only get populated once data
-has flowed all the way through bronze and silver. Bring up the stack and the
-one-time setup above, then, in order:
+*Note: ZTM's public feed only reports vehicles during actual service hours (approx. 5:00 AM - 11:59 PM Warsaw time).*
 
-**1. Start the ingestion poller** (not wired into Compose — it polls a public
-external feed, so it's kept standalone):
-
-Linux/macOS (bash):
-
-```
-cd ingestion
-KAFKA_BROKERS=localhost:19092 go run .
+**Step A: Start the Bronze streaming job** (runs indefinitely in the background to capture Kafka stream into Delta):
+```bash
+docker exec -d spark-master spark-submit --master spark://spark-master:7077 --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,io.delta:delta-spark_2.13:4.0.0 /opt/spark_jobs/bronze/ingest_bronze.py
 ```
 
-Windows (PowerShell):
-
-```powershell
-cd ingestion
-$env:KAFKA_BROKERS = "localhost:19092"
-go run .
-```
-
-**2. Start the bronze streaming job** (long-running — leave it in its own
-terminal):
-
-```
-docker exec spark-master spark-submit --master spark://spark-master:7077 --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,io.delta:delta-spark_2.13:4.0.0 /opt/spark_jobs/bronze/ingest_bronze.py
-```
-
-**3. Trigger the GTFS static refresh DAG** (downloads the schedule that
-silver joins against):
-
-```
+**Step B: Trigger the GTFS Static Download** (downloads the transit routes/schedule that silver joins against):
+```bash
 docker exec airflow-webserver airflow dags unpause gtfs_static_refresh
 docker exec airflow-webserver airflow dags trigger gtfs_static_refresh
 ```
+*Wait a few seconds for this to complete. You can monitor it in the Airflow UI at http://localhost:8085 (credentials: `admin` / `admin`).*
 
-Or from the Airflow UI at http://localhost:8085 (`admin` / `admin`): find
-`gtfs_static_refresh`, toggle it on, click the ▶ trigger button.
-
-**4. Run the silver trip-delays job**, once bronze has accumulated some data:
-
-```
+**Step C: Build the Silver Trip Delays** (once bronze has ingested some GPS pings, run the clean and match job):
+```bash
 docker exec spark-master spark-submit --packages io.delta:delta-spark_2.13:4.0.0 /opt/spark_jobs/silver/build_trip_delays.py
 ```
 
-**5. Trigger the hourly gold aggregation DAG**:
-
+**Step D: Run the Data Quality Checks** (runs the PySpark quality gates to validate silver schema and bounds):
+```bash
+docker exec airflow-webserver airflow dags unpause data_quality_checks
+docker exec airflow-webserver airflow dags trigger data_quality_checks
 ```
+
+**Step E: Run the Gold Rollups** (aggregates silver delays into performance stats and hot spots):
+```bash
 docker exec airflow-webserver airflow dags unpause hourly_gold_aggregation
 docker exec airflow-webserver airflow dags trigger hourly_gold_aggregation
 ```
 
-**6. Check the result:**
-
-```
+**Step F: Verify the pipeline outputs**
+Verify the Go API serves the gold route statistics:
+```bash
 curl http://localhost:8090/api/v1/routes/worst-offenders
 ```
+Then open the frontend React dashboard at http://localhost:5173 to interact with the performance charts, worst-performing leaderboards, and Leaflet delay maps.
 
-then open the dashboard at http://localhost:5173 — the leaderboard, hotspot
-map, and time series should now show live data.
+### 4. Running the PySpark Unit Tests
+To run the PySpark delay calculation unit tests (testing Warsaw DST transitions, early-arrival delays, and missing trip filters) inside the Spark master environment:
 
-Notes on timing: ZTM's feed only reports vehicles during real service hours,
-so step 1 produces nothing overnight. Steps 3–5 are idempotent (gold and
-silver both overwrite by partition), so re-running them after more data has
-landed is always safe and is exactly what `hourly_gold_aggregation`'s
-`@hourly` schedule does automatically once unpaused.
+```bash
+docker exec --user root spark-master python /opt/tests/test_delay_calculation.py
+```
 
 ## Component reference
 

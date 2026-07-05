@@ -137,6 +137,7 @@ services:
       - "8080:8080" # Master UI
     volumes:
       - ./spark_jobs:/opt/spark_jobs
+      - ./tests:/opt/tests
     networks:
       - transit-net
 
@@ -155,6 +156,7 @@ services:
       - "8081:8081" # Worker UI
     volumes:
       - ./spark_jobs:/opt/spark_jobs
+      - ./tests:/opt/tests
     depends_on:
       - spark-master
     networks:
@@ -198,6 +200,24 @@ services:
     networks:
       - transit-net
 
+  data-quality-watchdog:
+    build: ./data_quality
+    container_name: data-quality-watchdog
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_USE_SSL: "false"
+      BUCKET_NAME: lakehouse
+      TABLE_PATH: bronze/gps_positions
+      CHECK_INTERVAL_SECONDS: "30"
+      STALENESS_THRESHOLD_SECONDS: "300"
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - transit-net
+
 networks:
   transit-net:
     driver: bridge
@@ -205,3 +225,4 @@ networks:
 volumes:
   minio_data:
   postgres_data:
+
